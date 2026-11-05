@@ -12,6 +12,14 @@ relays = true
 # 0 waits until herdr closes the socket.
 relay_timeout_ms = 900000
 
+# Forward API calls to SSH machines saved on this host (`herdr machine list`).
+# The default is true. Set false to keep the relay local to this socket.
+# SIGHUP reloads this flag. A binary upgrade still needs a process restart.
+gateway = true
+
+# Optional absolute path of the herdr binary. Omit to use `herdr` on PATH.
+# herdr_bin = "/usr/bin/herdr"
+
 [peers.britton-grok]
 endpoint_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # "full" is every herdr method except server.stop and server.live_handoff.

@@ -28,7 +28,9 @@ let
   configFile = pkgs.writeText "herdr-iroh-server.toml" ''
     relays = ${if cfg.relays then "true" else "false"}
     relay_timeout_ms = ${toString cfg.relayTimeoutMs}
+    gateway = ${if cfg.gateway then "true" else "false"}
     ${lib.optionalString (cfg.socketPath != null) "socket_path = ${builtins.toJSON cfg.socketPath}"}
+    ${lib.optionalString (cfg.herdrPackage != null) "herdr_bin = ${builtins.toJSON "${cfg.herdrPackage}/bin/herdr"}"}
 
     ${peerBlocks}
   '';
@@ -123,6 +125,28 @@ in
       '';
     };
 
+    gateway = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Forward API calls to SSH machines saved for this user
+        (`herdr machine list`). Requires herdr 0.9.1 or newer on this
+        host and on each saved machine. The remote server must already
+        be running. Set false to relay only the local socket.
+      '';
+    };
+
+    herdrPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = ''
+        Herdr package used by the saved-machine gateway. When set,
+        `<package>/bin/herdr` is written as `herdr_bin` and the package
+        is added to the service PATH. `ssh` is taken from OpenSSH.
+        When unset, the service user's PATH must provide `herdr` and `ssh`.
+      '';
+    };
+
     allowedPeers = lib.mkOption {
       type = lib.types.attrsOf (
         lib.types.submodule {
@@ -204,6 +228,10 @@ in
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
+      # ssh for the saved-machine gateway. herdr is added when herdrPackage
+      # is set; otherwise the service user's PATH must already provide it.
+      path = [ pkgs.openssh ]
+        ++ lib.optionals (cfg.herdrPackage != null) [ cfg.herdrPackage ];
       serviceConfig = {
         Type = "simple";
         User = cfg.user;

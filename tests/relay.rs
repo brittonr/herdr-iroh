@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use herdr_iroh::client::{CallOptions, Node, dial_target};
@@ -42,6 +43,8 @@ async fn mcp_client_drives_serve_through_a_fake_herdr_socket() {
         secret_key: SecretKey::generate(),
         socket_path: socket,
         allow: Arc::new(RwLock::new(allow)),
+        gateway: Arc::new(AtomicBool::new(false)),
+        machines: Arc::new(herdr_iroh::InactiveGateway),
         relays: false,
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         relay_timeout: Duration::from_secs(8),

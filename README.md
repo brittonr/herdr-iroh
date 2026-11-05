@@ -6,6 +6,8 @@ On each herdr machine, `herdr-iroh serve` accepts iroh connections and copies he
 
 ```text
 assistant --stdio--> herdr-iroh mcp --iroh--> herdr-iroh serve --unix--> herdr.sock
+                                                      |
+                                                      +-- ssh --> saved machine's herdr socket
 ```
 
 The relay speaks herdr's own request lines (`{"id","method","params"}`) and returns herdr's response lines unchanged. A new herdr method works through `herdr_call` without a new release of this program. `events.subscribe` keeps the herdr socket open, and those later lines are forwarded on the same iroh stream. MCP tools return once, so one-shot waits use `events.wait` and `pane.wait_for_output` instead of holding a subscription open.
@@ -30,6 +32,8 @@ iroh encrypts the stream to the host's endpoint key. The n0 relays can see that 
 `herdr-iroh mcp` listens on stdin, not on a TCP port. Anyone who can run it as the bot user can call the tools. The host allowlist is what keeps other machines out.
 
 An empty allowlist starts the listener and rejects every connection.
+
+A gateway host can also forward calls to the SSH machines saved on that host (`herdr machine list`). The peer still has to be on the allowlist, and the same method policy applies to the inner call. Forwarded calls also refuse saved-machine catalog changes (`machine.add`, `remove`, `rename`, `enable`, `disable`) and methods that install, update, replace, or hand off a server, including `server.ssh_agent.register`. The SSH target, keys, and catalog file are not sent to the peer. Enumeration does not open SSH. `herdr_hosts` pings an enabled machine when it lists it.
 
 ## Endpoint ids
 
@@ -97,6 +101,30 @@ systemctl --user enable --now herdr-iroh.service
 
 Run it as the herdr user. The socket is mode `0600`.
 
+## Saved SSH machines
+
+Herdr's saved machines live in the client catalog on this host, not in the server socket. With `gateway` left on (the default), `serve` lists them and forwards API calls through the same noninteractive SSH bridge as `herdr --machine`. The JSON request is the bridge payload. It is not placed in the shell command. The remote command is `herdr --session <session> remote-api-bridge`.
+
+This needs herdr **0.9.1 or newer** on the gateway host and on each saved machine. That is the release that added `--machine` API forwarding (`herdr-api-bridge-v1`). The remote server must already be running and speak a compatible API. Forwarding does not install, start, update, or replace it, and it does not fall back to the local socket. A Windows saved machine is not forwarded.
+
+`herdr` and `ssh` must be on the `serve` process PATH. `herdr_bin` in `server.toml` overrides the herdr binary. The first `herdr --machine <label> status server` on this host fills herdr's executable cache; later forwards use that path when it is present. The gateway only reads the cache.
+
+Upgrade a host that is already running `serve`:
+
+```bash
+install -m 755 target/release/herdr-iroh ~/.local/bin/herdr-iroh
+systemctl --user restart herdr-iroh.service
+```
+
+A binary upgrade does not apply on `SIGHUP`. Restart the process. After restart the gateway is on unless `gateway = false`. `SIGHUP` reloads that flag and the allowlist. No client config change is required. `herdr_hosts` then lists each saved machine as `<host>/<label>`, or `<host>/<profile-id>` when the label is ambiguous. Every tool `host` argument accepts that form, as does `herdr-iroh ping laptop/instant-fill`.
+
+Check the herdr versions before expecting a forward to work:
+
+```bash
+herdr --version
+herdr --machine instant-fill status server
+```
+
 ## Bot box
 
 ```bash
@@ -123,11 +151,11 @@ herdr-iroh mcp
 
 No flags are required when the config and key are in the default paths. Stdout is the MCP protocol. Do not wrap it in a shell that merges stderr into stdout.
 
-Tools, all of which take optional `host`:
+Tools take optional `host`. Use the name from `client.toml`, or `<host>/<saved-machine>` for a saved SSH machine on that gateway. Omit `host` to use `default_host` (the gateway's own socket, not a saved machine).
 
 | Tool | Herdr method |
 | --- | --- |
-| `herdr_hosts` | ping each configured host and report reachability |
+| `herdr_hosts` | ping each configured host and its saved machines |
 | `herdr_status` | `ping` |
 | `herdr_list_agents` | `agent.list` |
 | `herdr_get_agent` | `agent.get` |
@@ -180,6 +208,7 @@ Host: `~/.config/herdr-iroh/server.toml`.
 ```toml
 relays = true
 relay_timeout_ms = 900000
+gateway = true
 
 [peers.britton-grok]
 endpoint_id = "<64 hex characters from the bot>"
@@ -203,6 +232,8 @@ State, including `secret_key`, is `~/.local/state/herdr-iroh` (`$XDG_STATE_HOME/
             enable = true;
             user = "britton";
             socketPath = "/home/britton/.config/herdr/herdr.sock";
+            # Optional. Puts bin/herdr on the service PATH and sets herdr_bin.
+            # herdrPackage = inputs.herdr.packages.${system}.default;
             allowedPeers.britton-grok.endpointId = "<bot endpoint id>";
           };
         }
@@ -224,7 +255,7 @@ A Home Manager shape is in [`examples/home.nix`](examples/home.nix). `nix build`
 
 ## Herdr API caveats
 
-Checked against herdr v0.9.5 (`2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`) and `master` on 2026-11-05.
+Checked against herdr v0.9.5 (`2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`) and `master` on 2026-11-05. Saved-machine forwarding needs herdr 0.9.1 or newer on both the gateway host and the saved machine (`--machine` API forwarding, `remote-api-bridge` capability `herdr-api-bridge-v1`).
 
 - `docs/next/api/herdr-api.schema.json` in that tag and on `master` are the same file: protocol **22**, `schema_version` 1, 102 methods, sha256 `9e2af207e9aa8183d4aeca5fde9cc48e7909bb40cdbd7cf21608a6d3ea78075b`. The Rust constant `PROTOCOL_VERSION` is 22. There is no `docs/versions/0.9.5` snapshot. Versioned docs in the tag stop at 0.9.3, so `docs/next` is the schema that matches this release.
 - The socket guide's ping example is only `{"result":{"type":"pong"}}`. The schema and the server also send `version` (string) and `protocol` (number). v0.9.5 may include `capabilities`, including `live_handoff`.

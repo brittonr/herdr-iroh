@@ -6,12 +6,14 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use herdr_iroh::client::{CallOptions, Node, dial_target};
 use herdr_iroh::config::{self, ClientFile, ServerFile};
+use herdr_iroh::gateway::CliMachines;
 use herdr_iroh::keys;
 use herdr_iroh::protocol::request_value;
 use herdr_iroh::serve::{ServeOptions, serve};
@@ -159,6 +161,11 @@ async fn cmd_serve(cli: &Cli, socket: Option<PathBuf>) -> anyhow::Result<()> {
         )
     })?;
     let allow = Arc::new(RwLock::new(file.allowlist()?));
+    let gateway = Arc::new(AtomicBool::new(file.gateway));
+    let herdr_bin = file
+        .herdr_bin
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("herdr"));
     let socket_path = socket
         .or(file.socket_path.clone())
         .unwrap_or_else(config::default_herdr_socket);
@@ -172,12 +179,15 @@ async fn cmd_serve(cli: &Cli, socket: Option<PathBuf>) -> anyhow::Result<()> {
         socket = %socket_path.display(),
         peers = peer_count,
         relays,
+        gateway = file.gateway,
         "iroh does not need an open inbound port; peers use relays unless relays are disabled"
     );
     let running = serve(ServeOptions {
         secret_key: key,
         socket_path: socket_path.clone(),
         allow: Arc::clone(&allow),
+        gateway: Arc::clone(&gateway),
+        machines: Arc::new(CliMachines::new(herdr_bin)),
         relays,
         bind_addr: cli.bind,
         relay_timeout: Duration::from_millis(file.relay_timeout_ms),
@@ -190,13 +200,18 @@ async fn cmd_serve(cli: &Cli, socket: Option<PathBuf>) -> anyhow::Result<()> {
         "socket_path": socket_path,
         "ticket_path": ticket_path,
         "allowed_peers": peer_count,
+        "gateway": gateway.load(Ordering::Acquire),
     }))?;
 
-    wait_for_shutdown(&config_path, &allow).await;
+    wait_for_shutdown(&config_path, &allow, &gateway).await;
     running.shutdown().await
 }
 
-async fn wait_for_shutdown(config_path: &Path, allow: &RwLock<herdr_iroh::Allowlist>) {
+async fn wait_for_shutdown(
+    config_path: &Path,
+    allow: &RwLock<herdr_iroh::Allowlist>,
+    gateway: &AtomicBool,
+) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut hangup = match signal(SignalKind::hangup()) {
         Ok(signal) => signal,
@@ -218,22 +233,28 @@ async fn wait_for_shutdown(config_path: &Path, allow: &RwLock<herdr_iroh::Allowl
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
-            _ = hangup.recv() => reload_allowlist(config_path, allow).await,
+            _ = hangup.recv() => reload_server_config(config_path, allow, gateway).await,
         }
     }
 }
 
-async fn reload_allowlist(config_path: &Path, allow: &RwLock<herdr_iroh::Allowlist>) {
+async fn reload_server_config(
+    config_path: &Path,
+    allow: &RwLock<herdr_iroh::Allowlist>,
+    gateway: &AtomicBool,
+) {
     match ServerFile::load(config_path) {
         Ok(file) => match file.allowlist() {
             Ok(next) => {
                 let peers = next.len();
+                let saved_machines = file.gateway;
                 *allow.write().await = next;
-                tracing::info!(peers, "reloaded allowlist");
+                gateway.store(saved_machines, Ordering::Release);
+                tracing::info!(peers, gateway = saved_machines, "reloaded server config");
             }
             Err(err) => tracing::error!(error = %err, "allowlist reload rejected"),
         },
-        Err(err) => tracing::error!(error = %err, "allowlist reload failed"),
+        Err(err) => tracing::error!(error = %err, "server config reload failed"),
     }
 }
 
@@ -258,7 +279,19 @@ async fn cmd_mcp(cli: &Cli) -> anyhow::Result<()> {
 
 async fn cmd_ping(cli: &Cli, host: &str) -> anyhow::Result<()> {
     let file = ClientFile::load(&client_config_path(cli))?;
-    let (_name, host_cfg) = file.resolve(Some(host))?;
+    let route = file.resolve_route(Some(host))?;
+    let host_cfg = file
+        .hosts
+        .get(&route.name)
+        .context("resolved host is missing")?;
+    let (method, params) = if let Some(machine) = &route.machine {
+        (
+            "gateway.forward",
+            json!({"machine": machine, "method": "ping", "params": {}}),
+        )
+    } else {
+        ("ping", json!({}))
+    };
     let relays = !cli.no_relays;
     let key = keys::load_or_create(&key_path(cli))?;
     let node = Node::bind(key, relays, cli.bind).await?;
@@ -266,7 +299,7 @@ async fn cmd_ping(cli: &Cli, host: &str) -> anyhow::Result<()> {
     let lines = node
         .call(
             &target,
-            &request_value("ping", json!({})),
+            &request_value(method, params),
             CallOptions {
                 timeout: Duration::from_secs(20),
                 max_lines: 1,

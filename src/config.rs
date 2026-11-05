@@ -24,6 +24,14 @@ pub struct ServerFile {
     /// until herdr closes the socket.
     #[serde(default = "default_relay_timeout_ms")]
     pub relay_timeout_ms: u64,
+    /// Forward API calls to SSH machines saved on this host. `herdr machine list`
+    /// is the catalog. The default is on.
+    #[serde(default = "default_true")]
+    pub gateway: bool,
+    /// `herdr` binary used for the saved-machine catalog and remote bridge.
+    /// Omit to use `herdr` on `PATH`.
+    #[serde(default)]
+    pub herdr_bin: Option<PathBuf>,
     #[serde(default)]
     pub peers: BTreeMap<String, PeerConfig>,
 }
@@ -34,6 +42,8 @@ impl Default for ServerFile {
             socket_path: None,
             relays: true,
             relay_timeout_ms: default_relay_timeout_ms(),
+            gateway: true,
+            herdr_bin: None,
             peers: BTreeMap::new(),
         }
     }
@@ -47,6 +57,15 @@ impl ServerFile {
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Allowlist::try_from_config(&file.peers)
             .map_err(|err| anyhow::anyhow!("{path}: {err}", path = path.display()))?;
+        if let Some(bin) = &file.herdr_bin {
+            let text = bin.to_string_lossy();
+            if text.is_empty() || text.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "{} herdr_bin is empty or contains a control character",
+                    path.display()
+                );
+            }
+        }
         Ok(file)
     }
 
@@ -129,6 +148,50 @@ impl ClientFile {
             .ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
         Ok((name, config))
     }
+
+    /// Resolve `host` or `default_host`.
+    ///
+    /// `gateway/machine` addresses a saved SSH machine on that gateway. The
+    /// machine selector is everything after the first slash, so a label may
+    /// itself contain slashes. The gateway name must be a configured host.
+    pub fn resolve_route(&self, host: Option<&str>) -> anyhow::Result<HostRoute> {
+        let raw = match host {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => self.default_host.clone().ok_or_else(|| {
+                anyhow::anyhow!("pass host, or set default_host in the client config")
+            })?,
+        };
+        if let Some((gateway, machine)) = raw.split_once('/') {
+            if gateway.is_empty() || machine.is_empty() {
+                anyhow::bail!("host {raw:?} is missing a gateway or a saved machine");
+            }
+            if !self.hosts.contains_key(gateway) {
+                anyhow::bail!("unknown host {gateway:?}");
+            }
+            if machine.len() > 256
+                || machine.chars().any(char::is_control)
+                || machine.starts_with('-')
+            {
+                anyhow::bail!("machine name is not allowed");
+            }
+            return Ok(HostRoute {
+                name: gateway.to_string(),
+                machine: Some(machine.to_string()),
+            });
+        }
+        self.resolve(Some(&raw))?;
+        Ok(HostRoute {
+            name: raw,
+            machine: None,
+        })
+    }
+}
+
+/// A configured iroh host, and an optional saved machine on that host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRoute {
+    pub name: String,
+    pub machine: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -240,5 +303,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ticket is for endpoint"), "{err}");
+    }
+
+    #[test]
+    fn gateway_defaults_on_and_can_be_disabled() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let text = format!(
+            r#"
+            [peers.bot]
+            endpoint_id = "{id}"
+            "#
+        );
+        let file: ServerFile = toml::from_str(&text).unwrap();
+        assert!(file.gateway);
+        assert!(file.herdr_bin.is_none());
+        let off: ServerFile = toml::from_str(&format!(
+            r#"
+            gateway = false
+            herdr_bin = "/usr/bin/herdr"
+
+            [peers.bot]
+            endpoint_id = "{id}"
+            "#
+        ))
+        .unwrap();
+        assert!(!off.gateway);
+        assert_eq!(
+            off.herdr_bin.as_deref(),
+            Some(std::path::Path::new("/usr/bin/herdr"))
+        );
+    }
+
+    #[test]
+    fn route_splits_a_saved_machine_from_its_gateway() {
+        let id = iroh::SecretKey::generate().public();
+        let text = format!(
+            r#"
+            default_host = "box"
+
+            [hosts.box]
+            endpoint_id = "{id}"
+            "#
+        );
+        let file = toml::from_str::<ClientFile>(&text).unwrap();
+        file.validate().unwrap();
+        assert_eq!(
+            file.resolve_route(None).unwrap(),
+            HostRoute {
+                name: "box".into(),
+                machine: None,
+            }
+        );
+        assert_eq!(
+            file.resolve_route(Some("box/instant-fill")).unwrap(),
+            HostRoute {
+                name: "box".into(),
+                machine: Some("instant-fill".into()),
+            }
+        );
+        assert_eq!(
+            file.resolve_route(Some("box/workbox/agents"))
+                .unwrap()
+                .machine
+                .as_deref(),
+            Some("workbox/agents")
+        );
+        assert!(file.resolve_route(Some("missing/instant-fill")).is_err());
+        assert!(file.resolve_route(Some("box/")).is_err());
+        assert!(file.resolve_route(Some("box/-lead")).is_err());
     }
 }

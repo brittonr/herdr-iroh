@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,8 +16,11 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
+use crate::gateway::{self, MachineBackend};
 use crate::policy::{Allowlist, Decision};
-use crate::protocol::{self, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, error_line, request_meta};
+use crate::protocol::{
+    self, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, encode_request, error_line, request_meta,
+};
 use crate::stream::{Flushing, read_line_limited};
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,6 +30,9 @@ pub struct ServeOptions {
     pub secret_key: SecretKey,
     pub socket_path: PathBuf,
     pub allow: Arc<RwLock<Allowlist>>,
+    /// `server.toml` `gateway`. SIGHUP stores a new value here.
+    pub gateway: Arc<AtomicBool>,
+    pub machines: Arc<dyn MachineBackend>,
     pub relays: bool,
     pub bind_addr: Option<SocketAddr>,
     pub relay_timeout: Duration,
@@ -81,6 +87,8 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<RunningServer> {
     let protocol = HerdrProtocol {
         socket_path: opts.socket_path,
         allow: opts.allow,
+        gateway: opts.gateway,
+        machines: opts.machines,
         relay_timeout: opts.relay_timeout,
     };
     let router = Router::builder(endpoint)
@@ -125,6 +133,8 @@ async fn wait_for_ip(endpoint: &Endpoint, budget: Duration) -> EndpointAddr {
 struct HerdrProtocol {
     socket_path: PathBuf,
     allow: Arc<RwLock<Allowlist>>,
+    gateway: Arc<AtomicBool>,
+    machines: Arc<dyn MachineBackend>,
     relay_timeout: Duration,
 }
 
@@ -199,6 +209,10 @@ impl HerdrProtocol {
             }
         };
 
+        if meta.method == "gateway.machines" || meta.method == "gateway.forward" {
+            return self.handle_gateway(remote, &meta, text, &mut send).await;
+        }
+
         let decision = self.allow.read().await.decide(&remote, &meta.method);
         if decision != Decision::Allow {
             tracing::info!(
@@ -247,6 +261,249 @@ impl HerdrProtocol {
             .await;
         }
         Ok(())
+    }
+
+    async fn handle_gateway(
+        &self,
+        remote: EndpointId,
+        meta: &crate::protocol::RequestMeta,
+        text: &str,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        if !self.allow.read().await.allows_peer(&remote) {
+            self.write_decision(
+                send,
+                &meta.id,
+                &meta.method,
+                Decision::Denied(crate::policy::DenyReason::NotOnAllowlist),
+            )
+            .await?;
+            return Ok(());
+        }
+        if meta.method == "gateway.machines" {
+            self.gateway_machines(remote, &meta.id, send).await?;
+            return Ok(());
+        }
+        let request = match gateway::parse_forward(text) {
+            Ok(request) => request,
+            Err(err) => {
+                write_text(send, &error_line(&meta.id, err.code, &err.message)).await?;
+                return Ok(());
+            }
+        };
+        if let Err(block) =
+            gateway::screen_forward(&*self.allow.read().await, &remote, &request.method)
+        {
+            tracing::info!(
+                endpoint_id = %remote,
+                method = %request.method,
+                machine = %request.machine,
+                request_id = %meta.id,
+                "denied gateway forward"
+            );
+            write_text(
+                send,
+                &error_line(&meta.id, block.code(), &block.message(&request.method)),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self.gateway.load(Ordering::Acquire) {
+            write_text(
+                send,
+                &error_line(&meta.id, "gateway_disabled", "saved-machine gateway is off"),
+            )
+            .await?;
+            return Ok(());
+        }
+        let machines = {
+            let backend = Arc::clone(&self.machines);
+            match tokio::task::spawn_blocking(move || backend.list()).await {
+                Ok(Ok(machines)) => machines,
+                Ok(Err(err)) => {
+                    write_text(send, &error_line(&meta.id, err.code, &err.message)).await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    write_text(
+                        send,
+                        &error_line(
+                            &meta.id,
+                            "gateway_unavailable",
+                            "saved-machine gateway failed",
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
+        if let Err(err) = gateway::select_saved(&machines, &request.machine) {
+            write_text(send, &error_line(&meta.id, err.code, &err.message)).await?;
+            return Ok(());
+        }
+        let inner = serde_json::json!({
+            "id": meta.id,
+            "method": request.method,
+            "params": request.params,
+        });
+        let line = match encode_request(&inner) {
+            Ok(line) => line,
+            Err(err) => {
+                write_text(
+                    send,
+                    &error_line(&meta.id, "invalid_request", &err.to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            endpoint_id = %remote,
+            method = %request.method,
+            machine = %request.machine,
+            request_id = %meta.id,
+            bytes = line.len(),
+            "gateway"
+        );
+        let relay = self.forward_saved(meta.id.clone(), request.machine, line, send);
+        if self.relay_timeout.is_zero() {
+            relay.await?;
+        } else if tokio::time::timeout(self.relay_timeout, relay)
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                endpoint_id = %remote,
+                method = %request.method,
+                request_id = %meta.id,
+                "gateway forward timed out"
+            );
+            let _ = write_text(
+                send,
+                &error_line(&meta.id, "timeout", "herdr-iroh relay timed out"),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn gateway_machines(
+        &self,
+        remote: EndpointId,
+        request_id: &str,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        if !self.gateway.load(Ordering::Acquire) {
+            let body = serde_json::json!({
+                "id": request_id,
+                "result": {"type": "machines", "enabled": false, "machines": []},
+            });
+            write_text(send, &format!("{body}\n")).await?;
+            return Ok(());
+        }
+        let backend = Arc::clone(&self.machines);
+        let listed = tokio::task::spawn_blocking(move || backend.list()).await;
+        let machines = match listed {
+            Ok(Ok(machines)) => machines,
+            Ok(Err(err)) => {
+                write_text(send, &error_line(request_id, err.code, &err.message)).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                write_text(
+                    send,
+                    &error_line(
+                        request_id,
+                        "gateway_unavailable",
+                        "saved-machine gateway failed",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            endpoint_id = %remote,
+            machines = machines.len(),
+            request_id,
+            "gateway machines"
+        );
+        let body = serde_json::json!({
+            "id": request_id,
+            "result": {
+                "type": "machines",
+                "enabled": true,
+                "machines": machines,
+            },
+        });
+        write_text(send, &format!("{body}\n")).await?;
+        Ok(())
+    }
+
+    async fn forward_saved(
+        &self,
+        request_id: String,
+        machine: String,
+        line: String,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = CancelOnDrop(Arc::clone(&cancel));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let backend = Arc::clone(&self.machines);
+        let cancel_thread = Arc::clone(&cancel);
+        let runner = tokio::task::spawn_blocking(move || {
+            backend.forward(&machine, line.as_bytes(), &cancel_thread, &mut |chunk| {
+                tx.blocking_send(chunk.to_vec()).is_ok()
+            })
+        });
+        let mut wrote = false;
+        while let Some(chunk) = rx.recv().await {
+            wrote = true;
+            send.write_all(&chunk).await?;
+            if !chunk.ends_with(b"\n") {
+                send.write_all(b"\n").await?;
+            }
+        }
+        let joined = runner
+            .await
+            .map_err(|_| anyhow::anyhow!("saved-machine gateway failed"))?;
+        if let Err(err) = joined {
+            if !wrote {
+                write_text(send, &error_line(&request_id, err.code, &err.message)).await?;
+            }
+            return Ok(());
+        }
+        if !wrote {
+            write_text(
+                send,
+                &error_line(
+                    &request_id,
+                    "bad_response",
+                    "saved machine closed the API bridge without a response",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let _ = send.shutdown().await;
+        drop(guard);
+        Ok(())
+    }
+
+    async fn write_decision(
+        &self,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+        id: &str,
+        method: &str,
+        decision: Decision,
+    ) -> anyhow::Result<()> {
+        write_text(
+            send,
+            &error_line(id, decision.error_code(), &decision.message(method)),
+        )
+        .await
     }
 
     async fn copy_herdr(
@@ -367,6 +624,14 @@ impl ProtocolHandler for HerdrProtocol {
             });
         }
         Ok(())
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
