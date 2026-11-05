@@ -1,0 +1,15 @@
+# Bot box. Copy to ~/.config/herdr-iroh/client.toml
+# Each endpoint id is that herdr host's id, from `herdr-iroh id` on the host
+# (or from the JSON line `herdr-iroh serve` prints).
+
+default_host = "laptop"
+
+[hosts.laptop]
+endpoint_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# Optional. Required when relays = false. A ticket carries direct addresses.
+# ticket = "endpoint..."
+relays = true
+
+[hosts.desk]
+endpoint_id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+relays = true

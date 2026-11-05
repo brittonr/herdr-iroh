@@ -1,0 +1,13 @@
+[Unit]
+Description=herdr API over iroh
+After=default.target
+
+[Service]
+Type=simple
+# Runs as your user, so it can connect to ~/.config/herdr/herdr.sock.
+ExecStart=%h/.local/bin/herdr-iroh serve
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

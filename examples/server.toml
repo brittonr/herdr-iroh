@@ -1,0 +1,20 @@
+# herdr host. Copy to ~/.config/herdr-iroh/server.toml
+# The endpoint id below is the bot's id, from `herdr-iroh id` on the bot box.
+
+# Unix socket of the local herdr server. Omit to use $HERDR_SOCKET_PATH,
+# then $HERDR_SESSION, then ~/.config/herdr/herdr.sock.
+# socket_path = "/home/britton/.config/herdr/herdr.sock"
+
+# n0 relays. Set false only for a direct ticket dial.
+relays = true
+
+# Cap on one relayed call, including agent.wait and events.subscribe.
+# 0 waits until herdr closes the socket.
+relay_timeout_ms = 900000
+
+[peers.britton-grok]
+endpoint_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# "full" is every herdr method except server.stop and server.live_handoff.
+# A list is narrower, for example ["agent.*", "pane.read", "ping"].
+# Naming a denied method in the list does not grant it.
+methods = "full"
