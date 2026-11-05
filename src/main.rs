@@ -162,6 +162,7 @@ async fn cmd_serve(cli: &Cli, socket: Option<PathBuf>) -> anyhow::Result<()> {
     })?;
     let allow = Arc::new(RwLock::new(file.allowlist()?));
     let gateway = Arc::new(AtomicBool::new(file.gateway));
+    let notify = file.notify_config()?;
     let herdr_bin = file
         .herdr_bin
         .clone()
@@ -188,6 +189,8 @@ async fn cmd_serve(cli: &Cli, socket: Option<PathBuf>) -> anyhow::Result<()> {
         allow: Arc::clone(&allow),
         gateway: Arc::clone(&gateway),
         machines: Arc::new(CliMachines::new(herdr_bin)),
+        notify,
+        dedupe_ttl: Duration::from_millis(file.prompt_dedupe_ttl_ms),
         relays,
         bind_addr: cli.bind,
         relay_timeout: Duration::from_millis(file.relay_timeout_ms),

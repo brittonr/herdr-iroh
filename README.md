@@ -118,6 +118,54 @@ systemctl --user restart herdr-iroh.service
 
 A binary upgrade does not apply on `SIGHUP`. Restart the process. After restart the gateway is on unless `gateway = false`. `SIGHUP` reloads that flag and the allowlist. No client config change is required. `herdr_hosts` then lists each saved machine as `<host>/<label>`, or `<host>/<profile-id>` when the label is ambiguous. Every tool `host` argument accepts that form, as does `herdr-iroh ping laptop/instant-fill`.
 
+## omp agents
+
+`herdr_agent_session` asks herdr for that pane's `agent_session` and, when `agent` is `omp` and `kind` is `path`, reads only that file. The path must be an absolute `/.omp/agent/sessions/*.jsonl` path with no `..`. The relay does not accept a path from the client. Other agent kinds return `supported: false`.
+
+The file is omp session JSONL (logical version 3). The reply contains the recent assistant text, the latest compaction recap (`shortSummary`, else `summary`), todos, a short list of recent tool calls, git commits the agent reported, and a pending ask. Idle recaps live in omp's `history.db` and are not in this file. A pending ask is an assistant `toolCall` named `ask` with no matching `toolResult`. Todos come from the latest successful `todo` tool result (`details.phases`) or a later `custom` entry with `customType` `user_todo_edit`. Commits are successful bash/shell tool calls whose command is `git commit`, with the hash taken from git's `[branch hash] subject` line.
+
+`herdr_answer_ask` re-reads that file and sends keys only when the same ask is still pending. omp's selector starts on `recommended`, or on the first option. The relay sends `up` or `down`, then `enter`. Multi-select asks are refused. Pass `question_id` from `herdr_agent_session`.
+
+`herdr_prompt_agent` and `herdr_send_text` take an optional `message_id`. The relay types that payload once within `prompt_dedupe_ttl_ms` (default 10 minutes) and returns a delivery receipt:
+
+```json
+{"result":{"type":"delivery_receipt","message_id":"prompt-1","delivery":"delivered","agent_status":"working","payload_match":true,"herdr":{}}}
+```
+
+`delivery` is `delivered`, `duplicate`, or `rejected`. A timeout retry from the MCP tool uses the same id. Reusing an id with different text does not type again; `payload_match` is false. A rejected receipt is also remembered, so a blocked prompt is not typed twice. Use a new id after the agent is free.
+
+These calls use the peer allowlist. `methods = "full"` includes `relay.agent_session` and `relay.answer`. A narrower list must name those methods, or `relay.*`. `agent.prompt` and `pane.send_text` are unchanged aside from the optional id. The same calls work through a saved machine: `host` is `gateway/label`, and the session file is read on that machine over its saved SSH target.
+
+## Status webhooks
+
+`serve` can POST agent status transitions from the local herdr socket and from enabled saved machines.
+
+```toml
+prompt_dedupe_ttl_ms = 600000
+
+[notify]
+host = "britton-desktop"
+debounce_ms = 1500
+secret_file = "/home/britton/.config/herdr-iroh/webhook.secret"
+urls = ["https://example.invalid/herdr"]
+```
+
+`secret_file` is required when `urls` is not empty. The file is UTF-8, not a symlink, and mode `0600` (not group or world readable). The secret is never logged. Each URL receives the same JSON body. The header is `X-Herdr-Signature-256: sha256=<hex>` and the hex is HMAC-SHA256 of the raw body. `curl` on the `serve` host performs the POST. Changes for one pane inside `debounce_ms` collapse to the latest status.
+
+```json
+{
+  "host": "britton-desktop/instant-fill",
+  "pane_id": "w1:p1",
+  "agent": "pi",
+  "status": "done",
+  "previous_status": "working",
+  "cwd": "/work/app",
+  "recap": "Importer streams now."
+}
+```
+
+`host` is `notify.host` for the local socket and `notify.host/<machine label>` for a saved machine. `recap` is the compaction summary when the session file is readable, otherwise null. `previous_status` is null the first time that pane is posted.
+
 Check the herdr versions before expecting a forward to work:
 
 ```bash
@@ -176,6 +224,8 @@ Tools take optional `host`. Use the name from `client.toml`, or `<host>/<saved-m
 | `herdr_focus` | `agent.focus`, `pane.focus`, `tab.focus`, or `workspace.focus` |
 | `herdr_rename` | the matching rename method |
 | `herdr_notify` | `notification.show` |
+| `herdr_agent_session` | read the omp session file herdr reports for that agent |
+| `herdr_answer_ask` | answer the pending omp ask by option index or label |
 | `herdr_call` | any method the host allowlist permits |
 
 Reads default to 100 lines and reject more than 500. Tool results larger than 512 KiB are dropped and replaced with a size error, so a pane dump does not land in the transcript. Pane text, agent text, and event payloads are data from that machine, not instructions.

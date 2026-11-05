@@ -96,6 +96,23 @@ pub trait MachineBackend: Send + Sync {
         cancel: &AtomicBool,
         on_line: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<(), MachineError>;
+
+    /// Read one remote file that herdr just reported as an omp session.
+    ///
+    /// The default refuses. `CliMachines` reads it over the saved machine's SSH
+    /// target, without taking a path from the peer.
+    fn read_file(
+        &self,
+        selector: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, MachineError> {
+        let _ = (selector, path, max_bytes);
+        Err(MachineError::new(
+            "gateway_unavailable",
+            "this gateway cannot read a saved-machine session file",
+        ))
+    }
 }
 
 /// Backend used when a caller has no catalog. `serve` also checks the gateway
@@ -265,6 +282,30 @@ impl MachineBackend for CliMachines {
             on_line,
         )
     }
+
+    fn read_file(
+        &self,
+        selector: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, MachineError> {
+        if crate::omp::session_path_allowed("omp", "path", path).is_err() {
+            return Err(MachineError::new(
+                "forbidden",
+                "session path is not an omp session file",
+            ));
+        }
+        let max_bytes = max_bytes.min(crate::omp::MAX_SESSION_BYTES);
+        let catalog = self.load_catalog()?;
+        let profile = select_profile(&catalog, selector)?;
+        let script = format!(
+            "set -f\np={}\nif [ -L \"$p\" ] || [ ! -f \"$p\" ]; then\nprintf '%s\\n' 'refusing session read' >&2\nexit 2\nfi\ntail -c {max_bytes} -- \"$p\"\n",
+            shell_quote(path)
+        );
+        let remote = wrap_posix_script(&script);
+        let args = ssh_args(&profile.target, &remote);
+        ssh_collect(&self.ssh, &profile.target, &args, max_bytes)
+    }
 }
 
 /// Why a forwarded method is refused before any SSH connection.
@@ -295,6 +336,7 @@ pub(crate) struct ForwardRequest {
     pub machine: String,
     pub method: String,
     pub params: Value,
+    pub message_id: Option<String>,
 }
 
 /// Pull the saved-machine selector and the inner herdr call out of one request.
@@ -342,10 +384,27 @@ pub(crate) fn parse_forward(text: &str) -> Result<ForwardRequest, MachineError> 
             ));
         }
     };
+    let message_id = match params.get("message_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if crate::receipt::message_id_ok(id) => Some(id.clone()),
+        Some(Value::String(_)) => {
+            return Err(MachineError::new(
+                "invalid_request",
+                "message_id must be 1 to 80 letters, digits, '.', '_', ':' or '-'",
+            ));
+        }
+        Some(_) => {
+            return Err(MachineError::new(
+                "invalid_request",
+                "message_id must be a string",
+            ));
+        }
+    };
     Ok(ForwardRequest {
         machine,
         method,
         params: inner,
+        message_id,
     })
 }
 
@@ -729,6 +788,10 @@ fn posix_bridge_command(executable: &str, session: &str) -> String {
     let script = format!(
         "set -f\nif capability=$({exe} --session {session} remote-api-bridge --check </dev/null 2>/dev/null) && [ \"$capability\" = herdr-api-bridge-v1 ]; then\nprintf '\\n%s\\n' '{READY_MARKER}'\nexec {exe} --session {session} remote-api-bridge <&3\nelse\nprintf '%s\\n' 'remote Herdr does not support machine API forwarding; update Herdr on this machine' >&2\nexit 78\nfi\n"
     );
+    wrap_posix_script(&script)
+}
+
+fn wrap_posix_script(script: &str) -> String {
     let encoded = base64_encode(script.as_bytes());
     format!(
         "/bin/sh -c 'exec 3<&0; echo {encoded} | (base64 --decode 2>/dev/null || base64 -d 2>/dev/null || base64 -D 2>/dev/null) | /bin/sh -s'"
@@ -770,6 +833,64 @@ fn base64_encode(data: &[u8]) -> String {
         _ => {}
     }
     out
+}
+
+fn ssh_collect(
+    ssh: &Path,
+    target: &str,
+    args: &[String],
+    max_bytes: usize,
+) -> Result<Vec<u8>, MachineError> {
+    let mut command = Command::new(ssh);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| {
+        MachineError::new("gateway_unavailable", "ssh is not available on this host")
+    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| MachineError::new("gateway_unavailable", "ssh bridge stdout is missing"))?;
+    let stderr = child.stderr.take();
+    let started = Instant::now();
+    let mut body = Vec::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        if started.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MachineError::new(
+                "timeout",
+                "saved machine session read timed out",
+            ));
+        }
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(count) => {
+                let take = count.min(max_bytes.saturating_sub(body.len()));
+                body.extend_from_slice(&buf[..take]);
+                if body.len() >= max_bytes {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let status = child.wait().ok();
+    let stderr_text = stderr.map(read_capped_owned).unwrap_or_default();
+    if body.is_empty() && status.as_ref().is_some_and(|status| !status.success()) {
+        return Err(bridge_failure(&stderr_text, target));
+    }
+    Ok(body)
+}
+
+fn read_capped_owned(pipe: impl Read) -> String {
+    read_capped(pipe, MAX_STDERR_BYTES)
 }
 
 fn ssh_forward(

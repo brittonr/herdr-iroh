@@ -32,8 +32,30 @@ pub struct ServerFile {
     /// Omit to use `herdr` on `PATH`.
     #[serde(default)]
     pub herdr_bin: Option<PathBuf>,
+    /// How long a `message_id` is remembered for `agent.prompt` and `pane.send_text`.
+    #[serde(default = "default_dedupe_ttl_ms")]
+    pub prompt_dedupe_ttl_ms: u64,
+    #[serde(default)]
+    pub notify: NotifyFile,
     #[serde(default)]
     pub peers: BTreeMap<String, PeerConfig>,
+}
+
+/// Webhook delivery for agent status changes. The HMAC secret stays in a file.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyFile {
+    /// Name used as `host` in the payload. Omit to use this machine's hostname.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Quiet period before a status is posted. Later changes within the window win.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+    /// UTF-8 secret, mode `0600`, not a symlink. Required when `urls` is not empty.
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
+    #[serde(default)]
+    pub urls: Vec<String>,
 }
 
 impl Default for ServerFile {
@@ -44,6 +66,8 @@ impl Default for ServerFile {
             relay_timeout_ms: default_relay_timeout_ms(),
             gateway: true,
             herdr_bin: None,
+            prompt_dedupe_ttl_ms: default_dedupe_ttl_ms(),
+            notify: NotifyFile::default(),
             peers: BTreeMap::new(),
         }
     }
@@ -66,7 +90,36 @@ impl ServerFile {
                 );
             }
         }
+        file.notify_config()?;
         Ok(file)
+    }
+
+    pub fn notify_config(&self) -> anyhow::Result<crate::notify::NotifyConfig> {
+        if self.notify.urls.is_empty() {
+            return Ok(crate::notify::config_from_parts(
+                self.notify.host.clone().unwrap_or_else(default_host_label),
+                self.notify.debounce_ms,
+                Vec::new(),
+                None,
+            ));
+        }
+        for url in &self.notify.urls {
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                anyhow::bail!("webhook url must start with http:// or https://");
+            }
+        }
+        let path = self
+            .notify
+            .secret_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("notify.urls requires notify.secret_file"))?;
+        let secret = crate::notify::load_secret(path)?;
+        Ok(crate::notify::config_from_parts(
+            self.notify.host.clone().unwrap_or_else(default_host_label),
+            self.notify.debounce_ms,
+            self.notify.urls.clone(),
+            Some(secret),
+        ))
     }
 
     pub fn allowlist(&self) -> anyhow::Result<Allowlist> {
@@ -200,6 +253,22 @@ fn default_true() -> bool {
 
 fn default_relay_timeout_ms() -> u64 {
     900_000
+}
+
+fn default_dedupe_ttl_ms() -> u64 {
+    600_000
+}
+
+fn default_debounce_ms() -> u64 {
+    1_500
+}
+
+fn default_host_label() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control))
+        .unwrap_or_else(|| "herdr".to_string())
 }
 
 #[must_use]

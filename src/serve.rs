@@ -17,10 +17,12 @@ use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
 use crate::gateway::{self, MachineBackend};
+use crate::notify::NotifyConfig;
 use crate::policy::{Allowlist, Decision};
 use crate::protocol::{
     self, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, encode_request, error_line, request_meta,
 };
+use crate::receipt::ReceiptStore;
 use crate::stream::{Flushing, read_line_limited};
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,6 +35,8 @@ pub struct ServeOptions {
     /// `server.toml` `gateway`. SIGHUP stores a new value here.
     pub gateway: Arc<AtomicBool>,
     pub machines: Arc<dyn MachineBackend>,
+    pub notify: NotifyConfig,
+    pub dedupe_ttl: Duration,
     pub relays: bool,
     pub bind_addr: Option<SocketAddr>,
     pub relay_timeout: Duration,
@@ -89,8 +93,16 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<RunningServer> {
         allow: opts.allow,
         gateway: opts.gateway,
         machines: opts.machines,
+        receipts: Arc::new(ReceiptStore::new(opts.dedupe_ttl)),
+        notify: opts.notify,
         relay_timeout: opts.relay_timeout,
     };
+    if protocol.notify.enabled() {
+        let watcher = protocol.clone();
+        tokio::spawn(async move {
+            watcher.watch_statuses().await;
+        });
+    }
     let router = Router::builder(endpoint)
         .accept(protocol::ALPN, protocol)
         .spawn();
@@ -135,6 +147,8 @@ struct HerdrProtocol {
     allow: Arc<RwLock<Allowlist>>,
     gateway: Arc<AtomicBool>,
     machines: Arc<dyn MachineBackend>,
+    receipts: Arc<ReceiptStore>,
+    notify: NotifyConfig,
     relay_timeout: Duration,
 }
 
@@ -232,6 +246,29 @@ impl HerdrProtocol {
             )
             .await?;
             return Ok(());
+        }
+
+        if is_relay_method(&meta.method) {
+            let params = object_params(text).unwrap_or_else(|| serde_json::json!({}));
+            return self
+                .dispatch_relay(remote, &meta.id, &meta.method, params, None, &mut send)
+                .await;
+        }
+        if matches!(meta.method.as_str(), "agent.prompt" | "pane.send_text")
+            && let Some(message_id) = top_message_id(text)
+        {
+            let params = object_params(text).unwrap_or_else(|| serde_json::json!({}));
+            return self
+                .idempotent_prompt(
+                    remote,
+                    &meta.id,
+                    &meta.method,
+                    params,
+                    message_id,
+                    None,
+                    &mut send,
+                )
+                .await;
         }
 
         // Method and size only. Params can contain pane text and prompts.
@@ -358,6 +395,33 @@ impl HerdrProtocol {
                 return Ok(());
             }
         };
+        if is_relay_method(&request.method) {
+            return self
+                .dispatch_relay(
+                    remote,
+                    &meta.id,
+                    &request.method,
+                    request.params,
+                    Some(request.machine),
+                    send,
+                )
+                .await;
+        }
+        if let Some(message_id) = request.message_id.clone()
+            && matches!(request.method.as_str(), "agent.prompt" | "pane.send_text")
+        {
+            return self
+                .idempotent_prompt(
+                    remote,
+                    &meta.id,
+                    &request.method,
+                    request.params,
+                    message_id,
+                    Some(request.machine),
+                    send,
+                )
+                .await;
+        }
         tracing::info!(
             endpoint_id = %remote,
             method = %request.method,
@@ -506,6 +570,574 @@ impl HerdrProtocol {
         .await
     }
 
+    async fn dispatch_relay(
+        &self,
+        remote: EndpointId,
+        request_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        machine: Option<String>,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        let value = match method {
+            "relay.agent_session" => {
+                self.agent_session(request_id, &params, machine.as_deref())
+                    .await
+            }
+            "relay.answer" => {
+                self.answer_ask(request_id, &params, machine.as_deref())
+                    .await
+            }
+            _ => serde_json::json!({
+                "id": request_id,
+                "error": {"code": "invalid_request", "message": "unknown relay method"}
+            }),
+        };
+        tracing::info!(
+            endpoint_id = %remote,
+            method,
+            machine = machine.as_deref().unwrap_or("local"),
+            request_id,
+            "relay method"
+        );
+        write_text(send, &format!("{value}\n")).await?;
+        let _ = send.shutdown().await;
+        Ok(())
+    }
+
+    async fn agent_session(
+        &self,
+        request_id: &str,
+        params: &serde_json::Value,
+        machine: Option<&str>,
+    ) -> serde_json::Value {
+        let target = params
+            .get("target")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if target.is_empty() || target.len() > 256 {
+            return error_value(request_id, "invalid_request", "target is required");
+        }
+        let messages = params
+            .get("messages")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::omp::default_message_count() as u64)
+            .clamp(1, 20) as usize;
+        let agent = match self
+            .exchange(machine, "agent.get", serde_json::json!({"target": target}))
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return error_value(request_id, "herdr_unavailable", &message),
+        };
+        if agent.get("error").is_some() {
+            return agent;
+        }
+        let session = &agent["result"]["agent_session"];
+        let kind = session["agent"].as_str().unwrap_or("");
+        let path_kind = session["kind"].as_str().unwrap_or("");
+        let path = session["value"].as_str().unwrap_or("");
+        if let Err(reason) = crate::omp::session_path_allowed(kind, path_kind, path) {
+            let view = crate::omp::unsupported(Some(kind).filter(|name| !name.is_empty()), reason);
+            return serde_json::json!({"id": request_id, "result": crate::omp::view_json(&view)});
+        }
+        let bytes = if let Some(machine) = machine {
+            let backend = Arc::clone(&self.machines);
+            let machine = machine.to_string();
+            let path = path.to_string();
+            match tokio::task::spawn_blocking(move || {
+                backend.read_file(&machine, &path, crate::omp::MAX_SESSION_BYTES)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(err)) => return error_value(request_id, err.code, &err.message),
+                Err(_) => {
+                    return error_value(request_id, "gateway_unavailable", "session read failed");
+                }
+            }
+        } else {
+            match read_local_session(std::path::Path::new(path)) {
+                Ok(bytes) => bytes,
+                Err(message) => return error_value(request_id, "forbidden", &message),
+            }
+        };
+        let view = crate::omp::parse_session(&bytes, messages);
+        serde_json::json!({"id": request_id, "result": crate::omp::view_json(&view)})
+    }
+
+    async fn answer_ask(
+        &self,
+        request_id: &str,
+        params: &serde_json::Value,
+        machine: Option<&str>,
+    ) -> serde_json::Value {
+        let target = params
+            .get("target")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let question_id = params
+            .get("question_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if target.is_empty() || question_id.is_empty() {
+            return error_value(
+                request_id,
+                "invalid_request",
+                "target and question_id are required",
+            );
+        }
+        let choice = match ask_choice(params) {
+            Ok(choice) => choice,
+            Err(message) => return error_value(request_id, "invalid_request", message),
+        };
+        let Some(first) = self.load_ask(target, machine).await else {
+            return error_value(request_id, "not_found", "no omp session ask is pending");
+        };
+        if let Err(message) = first {
+            return error_value(request_id, "herdr_unavailable", &message);
+        }
+        let first = first.unwrap();
+        if first.question_id != question_id {
+            return error_value(
+                request_id,
+                "conflict",
+                "the pending ask is not the question that was requested",
+            );
+        }
+        if first.question_count > 1 {
+            return error_value(
+                request_id,
+                "conflict",
+                "only the first question of an ask is on screen",
+            );
+        }
+        let keys = match crate::omp::answer_keys(&first, &choice) {
+            Ok(keys) => keys,
+            Err(message) => return error_value(request_id, "invalid_request", message),
+        };
+        let fingerprint = crate::omp::ask_fingerprint(&first);
+        let second = self.load_ask(target, machine).await;
+        let Some(second) = second else {
+            return error_value(
+                request_id,
+                "conflict",
+                "the ask changed before it could be answered",
+            );
+        };
+        let Ok(second) = second else {
+            return error_value(
+                request_id,
+                "conflict",
+                "the ask changed before it could be answered",
+            );
+        };
+        if crate::omp::ask_fingerprint(&second) != fingerprint {
+            return error_value(
+                request_id,
+                "conflict",
+                "the ask changed before it could be answered",
+            );
+        }
+        match self
+            .exchange(
+                machine,
+                "agent.send_keys",
+                serde_json::json!({"target": target, "keys": keys}),
+            )
+            .await
+        {
+            Ok(value) if value.get("error").is_none() => serde_json::json!({
+                "id": request_id,
+                "result": {
+                    "type": "ask_answer",
+                    "question_id": question_id,
+                    "sent": true,
+                    "keys": keys,
+                    "herdr": value,
+                }
+            }),
+            Ok(value) => value,
+            Err(message) => error_value(request_id, "herdr_unavailable", &message),
+        }
+    }
+
+    async fn load_ask(
+        &self,
+        target: &str,
+        machine: Option<&str>,
+    ) -> Option<Result<crate::omp::PendingAsk, String>> {
+        let agent = self
+            .exchange(machine, "agent.get", serde_json::json!({"target": target}))
+            .await
+            .ok()?;
+        if agent.get("error").is_some() {
+            return Some(Err("agent.get failed".to_string()));
+        }
+        let session = &agent["result"]["agent_session"];
+        let kind = session["agent"].as_str().unwrap_or("");
+        let path_kind = session["kind"].as_str().unwrap_or("");
+        let path = session["value"].as_str().unwrap_or("");
+        if crate::omp::session_path_allowed(kind, path_kind, path).is_err() {
+            return None;
+        }
+        let bytes = if let Some(machine) = machine {
+            let backend = Arc::clone(&self.machines);
+            let machine = machine.to_string();
+            let path = path.to_string();
+            tokio::task::spawn_blocking(move || {
+                backend.read_file(&machine, &path, crate::omp::MAX_SESSION_BYTES)
+            })
+            .await
+            .ok()?
+            .ok()?
+        } else {
+            read_local_session(std::path::Path::new(path)).ok()?
+        };
+        crate::omp::parse_session(&bytes, 1).ask.map(Ok)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn idempotent_prompt(
+        &self,
+        remote: EndpointId,
+        request_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        message_id: String,
+        machine: Option<String>,
+        send: &mut Flushing<iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        if !crate::receipt::message_id_ok(&message_id) {
+            write_text(
+                send,
+                &error_line(
+                    request_id,
+                    "invalid_request",
+                    "message_id must be 1 to 80 letters, digits, '.', '_', ':' or '-'",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let text = params
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let hash = crate::receipt::payload_hash(text);
+        let key = format!(
+            "{remote}|{}|{method}|{message_id}",
+            machine.as_deref().unwrap_or("local")
+        );
+        let store = Arc::clone(&self.receipts);
+        let begin_key = key.clone();
+        let begin_hash = hash.clone();
+        let begun = tokio::task::spawn_blocking(move || store.begin(&begin_key, &begin_hash))
+            .await
+            .map_err(|_| anyhow::anyhow!("delivery receipt failed"))?
+            .map_err(|message| anyhow::anyhow!(message))?;
+        if let Some(receipt) = begun {
+            let payload_match = receipt.payload_hash == hash;
+            let body =
+                crate::receipt::receipt_json(request_id, &message_id, &receipt, payload_match);
+            write_text(send, &format!("{body}\n")).await?;
+            let _ = send.shutdown().await;
+            return Ok(());
+        }
+        let response = match self
+            .exchange(machine.as_deref(), method, params.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => {
+                let receipt = crate::receipt::Receipt {
+                    delivery: "rejected",
+                    agent_status: None,
+                    herdr: serde_json::json!({"error": {"code": "herdr_unavailable", "message": message}}),
+                    payload_hash: hash,
+                };
+                self.receipts.finish(&key, receipt.clone());
+                let body = crate::receipt::receipt_json(request_id, &message_id, &receipt, true);
+                write_text(send, &format!("{body}\n")).await?;
+                return Ok(());
+            }
+        };
+        let delivery = if response.get("error").is_some() {
+            "rejected"
+        } else {
+            "delivered"
+        };
+        let mut agent_status = status_in(&response);
+        if agent_status.is_none()
+            && delivery == "delivered"
+            && let Some(target) = params.get("target").and_then(serde_json::Value::as_str)
+            && let Ok(agent) = self
+                .exchange(
+                    machine.as_deref(),
+                    "agent.get",
+                    serde_json::json!({"target": target}),
+                )
+                .await
+        {
+            agent_status = status_in(&agent);
+        }
+        let receipt = crate::receipt::Receipt {
+            delivery,
+            agent_status,
+            herdr: response,
+            payload_hash: hash.clone(),
+        };
+        self.receipts.finish(&key, receipt.clone());
+        tracing::info!(
+            endpoint_id = %remote,
+            method,
+            message_id,
+            delivery,
+            machine = machine.as_deref().unwrap_or("local"),
+            "delivery receipt"
+        );
+        let body = crate::receipt::receipt_json(request_id, &message_id, &receipt, true);
+        write_text(send, &format!("{body}\n")).await?;
+        let _ = send.shutdown().await;
+        Ok(())
+    }
+
+    async fn exchange(
+        &self,
+        machine: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let line = encode_request(&serde_json::json!({
+            "id": format!("relay-{}", method.replace('.', "-")),
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|err| err.to_string())?;
+        if let Some(machine) = machine {
+            let backend = Arc::clone(&self.machines);
+            let machine = machine.to_string();
+            let bytes = tokio::task::spawn_blocking(move || {
+                let mut out = Vec::new();
+                backend.forward(
+                    &machine,
+                    line.as_bytes(),
+                    &AtomicBool::new(false),
+                    &mut |chunk| {
+                        out.extend_from_slice(chunk);
+                        out.len() < crate::protocol::MAX_RESPONSE_BYTES
+                    },
+                )?;
+                Ok::<Vec<u8>, crate::gateway::MachineError>(out)
+            })
+            .await
+            .map_err(|_| "saved-machine call failed".to_string())?
+            .map_err(|err| err.message)?;
+            first_json(&bytes)
+        } else {
+            local_exchange(&self.socket_path, &line).await
+        }
+    }
+
+    async fn watch_statuses(self) {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(String, String, Option<String>, String)>(64);
+        let local = self.clone();
+        let local_tx = tx.clone();
+        tokio::spawn(async move {
+            local.watch_local(local_tx).await;
+        });
+        let saved = self.clone();
+        let saved_tx = tx.clone();
+        tokio::spawn(async move {
+            saved.watch_saved_machines(saved_tx).await;
+        });
+        drop(tx);
+        let mut debounce = crate::notify::Debounce::default();
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let host = self.notify.host.clone();
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some((scope, pane, agent, status)) = event else { break };
+                    debounce.push(&format!("{scope}\n{pane}"), &status, std::time::Instant::now());
+                    let _ = agent;
+                }
+                _ = interval.tick() => {
+                    let ready = debounce.due(std::time::Instant::now(), self.notify.debounce);
+                    for (key, status, previous) in ready {
+                        let Some((scope, pane)) = key.split_once('\n') else { continue };
+                        self.post_status(scope, pane, &status, previous.as_deref(), &host).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn watch_local(
+        &self,
+        tx: tokio::sync::mpsc::Sender<(String, String, Option<String>, String)>,
+    ) {
+        let host = self.notify.host.clone();
+        loop {
+            if self.follow_socket(None, &host, &tx).await.is_err() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    async fn watch_saved_machines(
+        &self,
+        tx: tokio::sync::mpsc::Sender<(String, String, Option<String>, String)>,
+    ) {
+        let running = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        loop {
+            if self.gateway.load(Ordering::Acquire)
+                && let Ok(machines) = self.machines.list()
+            {
+                for machine in machines.into_iter().filter(|machine| machine.enabled) {
+                    let scope = format!("{}/{}", self.notify.host, machine.label);
+                    {
+                        let mut guard = running.lock().unwrap_or_else(|err| err.into_inner());
+                        if !guard.insert(scope.clone()) {
+                            continue;
+                        }
+                    }
+                    let protocol = self.clone();
+                    let tx = tx.clone();
+                    let selector = machine.label.clone();
+                    let running = Arc::clone(&running);
+                    tokio::spawn(async move {
+                        let _ = protocol.follow_socket(Some(selector), &scope, &tx).await;
+                        running
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .remove(&scope);
+                    });
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
+    async fn follow_socket(
+        &self,
+        machine: Option<String>,
+        scope: &str,
+        tx: &tokio::sync::mpsc::Sender<(String, String, Option<String>, String)>,
+    ) -> Result<(), ()> {
+        let request = encode_request(&serde_json::json!({
+            "id": "relay-status",
+            "method": "events.subscribe",
+            "params": {"subscriptions": [{"type": "pane.agent_status_changed"}]}
+        }))
+        .map_err(|_| ())?;
+        if let Some(machine) = machine {
+            let backend = Arc::clone(&self.machines);
+            let scope = scope.to_string();
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let runner = tokio::task::spawn_blocking(move || {
+                let cancel = AtomicBool::new(false);
+                backend.forward(&machine, request.as_bytes(), &cancel, &mut |chunk| {
+                    line_tx.blocking_send(chunk.to_vec()).is_ok()
+                })
+            });
+            while let Some(chunk) = line_rx.recv().await {
+                if let Some(event) = status_event(&chunk) {
+                    let _ = tx.send((scope.clone(), event.0, event.1, event.2)).await;
+                }
+            }
+            let _ = runner.await;
+            Err(())
+        } else {
+            let mut stream = UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|_| ())?;
+            stream.write_all(request.as_bytes()).await.map_err(|_| ())?;
+            let mut reader = BufReader::new(stream);
+            loop {
+                let line = read_line_limited(&mut reader, MAX_RESPONSE_BYTES)
+                    .await
+                    .map_err(|_| ())?;
+                let Some(line) = line else { return Err(()) };
+                if let Some(event) = status_event(&line) {
+                    let _ = tx
+                        .send((scope.to_string(), event.0, event.1, event.2))
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn post_status(
+        &self,
+        scope: &str,
+        pane: &str,
+        status: &str,
+        previous: Option<&str>,
+        host_label: &str,
+    ) {
+        let machine = scope
+            .strip_prefix(&format!("{host_label}/"))
+            .filter(|rest| !rest.is_empty());
+        let (agent, cwd, recap) = self.status_context(machine, pane).await;
+        let note = crate::notify::StatusNote {
+            host: scope.to_string(),
+            pane_id: pane.to_string(),
+            agent,
+            status: status.to_string(),
+            cwd,
+            recap,
+        };
+        let body = serde_json::to_vec(&crate::notify::payload(&note, previous)).unwrap_or_default();
+        let Some(signature) = self.notify.sign(&body) else {
+            return;
+        };
+        for url in self.notify.urls() {
+            if let Err(err) = crate::notify::post_curl(url, &body, &signature) {
+                tracing::warn!(error = %err, "webhook post failed");
+            }
+        }
+    }
+
+    async fn status_context(
+        &self,
+        machine: Option<&str>,
+        pane: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let Ok(agent) = self
+            .exchange(machine, "agent.get", serde_json::json!({"target": pane}))
+            .await
+        else {
+            return (None, None, None);
+        };
+        let name = agent["result"]["name"]
+            .as_str()
+            .or_else(|| agent["result"]["agent"].as_str())
+            .map(str::to_string);
+        let cwd = agent["result"]["cwd"].as_str().map(str::to_string);
+        let session = &agent["result"]["agent_session"];
+        let recap = (|| {
+            let kind = session["agent"].as_str().unwrap_or("");
+            let path_kind = session["kind"].as_str().unwrap_or("");
+            let path = session["value"].as_str().unwrap_or("");
+            crate::omp::session_path_allowed(kind, path_kind, path).ok()?;
+            let bytes = if let Some(machine) = machine {
+                self.machines
+                    .read_file(machine, path, crate::omp::MAX_SESSION_BYTES)
+                    .ok()?
+            } else {
+                read_local_session(std::path::Path::new(path)).ok()?
+            };
+            crate::omp::parse_session(&bytes, 1)
+                .recap
+                .map(|recap| recap.text)
+        })();
+        (name, cwd, recap)
+    }
+
     async fn copy_herdr(
         &self,
         request_id: &str,
@@ -625,6 +1257,143 @@ impl ProtocolHandler for HerdrProtocol {
         }
         Ok(())
     }
+}
+
+fn is_relay_method(method: &str) -> bool {
+    matches!(method, "relay.agent_session" | "relay.answer")
+}
+
+fn object_params(text: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    match value.get("params") {
+        Some(serde_json::Value::Object(map)) => Some(serde_json::Value::Object(map.clone())),
+        None => Some(serde_json::json!({})),
+        _ => None,
+    }
+}
+
+fn top_message_id(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get("message_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn error_value(id: &str, code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({"id": id, "error": {"code": code, "message": message}})
+}
+
+fn status_in(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/result/agent_status")
+        .or_else(|| value.pointer("/result/status"))
+        .or_else(|| value.pointer("/result/agent/agent_status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn ask_choice(params: &serde_json::Value) -> Result<crate::omp::AskChoice, &'static str> {
+    let index = params
+        .get("option_index")
+        .and_then(serde_json::Value::as_u64);
+    let label = params
+        .get("option_label")
+        .and_then(serde_json::Value::as_str)
+        .filter(|label| !label.is_empty());
+    match (index, label) {
+        (Some(_), Some(_)) | (None, None) => Err("pass option_index or option_label, not both"),
+        (Some(index), None) => Ok(crate::omp::AskChoice::Index(index as usize)),
+        (None, Some(label)) => Ok(crate::omp::AskChoice::Label(label.to_string())),
+    }
+}
+
+fn status_event(bytes: &[u8]) -> Option<(String, Option<String>, String)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let (pane, agent, status) =
+        if let Some(event) = value.get("event").and_then(|event| event.as_object()) {
+            let kind = event
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if kind != "pane.agent_status_changed" && kind != "pane_agent_status_changed" {
+                return None;
+            }
+            (
+                event.get("pane_id")?.as_str()?.to_string(),
+                event
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                event.get("agent_status")?.as_str()?.to_string(),
+            )
+        } else if value.get("event").and_then(serde_json::Value::as_str)
+            == Some("pane.agent_status_changed")
+        {
+            let data = value.get("data")?.as_object()?;
+            (
+                data.get("pane_id")?.as_str()?.to_string(),
+                data.get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                data.get("agent_status")?.as_str()?.to_string(),
+            )
+        } else {
+            return None;
+        };
+    Some((pane, agent, status))
+}
+
+fn first_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "herdr response is not utf-8".to_string())?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') {
+            return serde_json::from_str(trimmed)
+                .map_err(|_| "herdr response is not json".to_string());
+        }
+    }
+    Err("herdr closed the stream without a response".to_string())
+}
+
+async fn local_exchange(path: &std::path::Path, line: &str) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|_| "cannot connect to herdr socket".to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|_| "herdr write failed".to_string())?;
+    let mut reader = BufReader::new(stream);
+    let line = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_line_limited(&mut reader, MAX_RESPONSE_BYTES),
+    )
+    .await
+    .map_err(|_| "timed out waiting for herdr".to_string())?
+    .map_err(|err| err.to_string())?
+    .ok_or_else(|| "herdr closed the socket".to_string())?;
+    serde_json::from_slice(&line).map_err(|_| "herdr response is not json".to_string())
+}
+
+fn read_local_session(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(path)
+        .map_err(|_| "cannot read the omp session file".to_string())?;
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if len > crate::omp::MAX_SESSION_BYTES as u64 {
+        let _ = file.seek(SeekFrom::End(-(crate::omp::MAX_SESSION_BYTES as i64)));
+    }
+    let mut buf = Vec::new();
+    file.take(crate::omp::MAX_SESSION_BYTES as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| "cannot read the omp session file".to_string())?;
+    Ok(buf)
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);

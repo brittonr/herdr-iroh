@@ -45,6 +45,8 @@ async fn mcp_client_drives_serve_through_a_fake_herdr_socket() {
         allow: Arc::new(RwLock::new(allow)),
         gateway: Arc::new(AtomicBool::new(false)),
         machines: Arc::new(herdr_iroh::InactiveGateway),
+        notify: herdr_iroh::notify::NotifyConfig::default(),
+        dedupe_ttl: Duration::from_secs(600),
         relays: false,
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         relay_timeout: Duration::from_secs(8),

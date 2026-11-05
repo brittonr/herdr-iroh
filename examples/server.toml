@@ -20,6 +20,15 @@ gateway = true
 # Optional absolute path of the herdr binary. Omit to use `herdr` on PATH.
 # herdr_bin = "/usr/bin/herdr"
 
+# How long a message_id is remembered for agent.prompt and pane.send_text.
+# prompt_dedupe_ttl_ms = 600000
+
+# [notify]
+# host = "britton-desktop"
+# debounce_ms = 1500
+# secret_file = "/home/britton/.config/herdr-iroh/webhook.secret"
+# urls = ["https://example.invalid/herdr"]
+
 [peers.britton-grok]
 endpoint_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # "full" is every herdr method except server.stop and server.live_handoff.

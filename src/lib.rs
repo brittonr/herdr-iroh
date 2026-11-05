@@ -11,8 +11,11 @@ pub mod config;
 pub mod gateway;
 pub mod keys;
 pub mod mcp;
+pub mod notify;
+pub mod omp;
 pub mod policy;
 pub mod protocol;
+pub mod receipt;
 pub mod serve;
 mod stream;
 

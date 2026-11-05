@@ -125,6 +125,8 @@ async fn gateway_routes_saved_machines_and_blocks_dangerous_calls() {
         allow: Arc::new(RwLock::new(Allowlist::try_from_config(&peers).unwrap())),
         gateway: Arc::clone(&gateway),
         machines: Arc::clone(&machines) as Arc<dyn MachineBackend>,
+        notify: herdr_iroh::notify::NotifyConfig::default(),
+        dedupe_ttl: Duration::from_secs(600),
         relays: false,
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         relay_timeout: Duration::from_secs(8),
