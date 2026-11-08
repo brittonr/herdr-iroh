@@ -60,9 +60,7 @@ async fn mcp_client_drives_serve_through_a_fake_herdr_socket() {
         relays: false,
     };
     let target = dial_target(&host, false).unwrap();
-    let node = Node::bind(client_key, false, Some("127.0.0.1:0".parse().unwrap()))
-        .await
-        .unwrap();
+    let node = Node::new(client_key, false, Some("127.0.0.1:0".parse().unwrap()));
 
     let pong = node
         .call(
@@ -125,13 +123,11 @@ async fn mcp_client_drives_serve_through_a_fake_herdr_socket() {
     assert_eq!(streamed[0]["result"]["type"], "subscription_started");
     assert_eq!(streamed[1]["event"]["type"], "workspace_created");
 
-    let stranger = Node::bind(
+    let stranger = Node::new(
         SecretKey::generate(),
         false,
         Some("127.0.0.1:0".parse().unwrap()),
-    )
-    .await
-    .unwrap();
+    );
     let rejected = stranger
         .call(
             &target,

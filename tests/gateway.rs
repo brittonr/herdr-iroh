@@ -140,9 +140,7 @@ async fn gateway_routes_saved_machines_and_blocks_dangerous_calls() {
         relays: false,
     };
     let target = dial_target(&host, false).unwrap();
-    let node = Node::bind(client_key, false, Some("127.0.0.1:0".parse().unwrap()))
-        .await
-        .unwrap();
+    let node = Node::new(client_key, false, Some("127.0.0.1:0".parse().unwrap()));
 
     let local = call(&node, &target, "ping", json!({}), 1).await;
     assert_eq!(local[0]["result"]["type"], "pong");

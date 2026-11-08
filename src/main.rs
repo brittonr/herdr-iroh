@@ -271,7 +271,7 @@ async fn cmd_mcp(cli: &Cli) -> anyhow::Result<()> {
     })?;
     let relays = !cli.no_relays;
     let key = keys::load_or_create(&key_path(cli))?;
-    let node = Node::bind(key, relays, cli.bind).await?;
+    let node = Node::new(key, relays, cli.bind);
     tracing::info!(
         endpoint_id = %node.endpoint_id(),
         hosts = file.hosts.len(),
@@ -297,7 +297,7 @@ async fn cmd_ping(cli: &Cli, host: &str) -> anyhow::Result<()> {
     };
     let relays = !cli.no_relays;
     let key = keys::load_or_create(&key_path(cli))?;
-    let node = Node::bind(key, relays, cli.bind).await?;
+    let node = Node::new(key, relays, cli.bind);
     let target = dial_target(host_cfg, node.relays_enabled())?;
     let lines = node
         .call(

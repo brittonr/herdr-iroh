@@ -55,6 +55,8 @@ The first run creates the key. Later runs print the same id.
 
 `serve` and `mcp` on the same machine share that key when they use the same state directory. A herdr host and the bot box are different machines, so each gets its own key. Two `serve` processes on one machine (two herdr sessions) need two `--state-dir` values, because one key is one endpoint.
 
+Several `mcp` processes may share one key, for example when a bot app starts one per session. An iroh relay delivers a key's packets only to the endpoint that connected last, and the others stop hearing replies without an error. So `mcp` binds its endpoint on the first tool call, not at startup, and binds again when a call follows 10 seconds without calls or a timed-out call. Two processes calling in the same few seconds can still cost one of them a timeout before it takes the relay back.
+
 ## Herdr host
 
 Install the binary, then:
