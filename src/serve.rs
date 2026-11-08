@@ -633,7 +633,7 @@ impl HerdrProtocol {
         if agent.get("error").is_some() {
             return agent;
         }
-        let session = &agent["result"]["agent_session"];
+        let session = &agent_info(&agent)["agent_session"];
         let kind = session["agent"].as_str().unwrap_or("");
         let path_kind = session["kind"].as_str().unwrap_or("");
         let path = session["value"].as_str().unwrap_or("");
@@ -774,7 +774,7 @@ impl HerdrProtocol {
         if agent.get("error").is_some() {
             return Some(Err("agent.get failed".to_string()));
         }
-        let session = &agent["result"]["agent_session"];
+        let session = &agent_info(&agent)["agent_session"];
         let kind = session["agent"].as_str().unwrap_or("");
         let path_kind = session["kind"].as_str().unwrap_or("");
         let path = session["value"].as_str().unwrap_or("");
@@ -1113,12 +1113,13 @@ impl HerdrProtocol {
         else {
             return (None, None, None);
         };
-        let name = agent["result"]["name"]
+        let info = agent_info(&agent);
+        let name = info["name"]
             .as_str()
-            .or_else(|| agent["result"]["agent"].as_str())
+            .or_else(|| info["agent"].as_str())
             .map(str::to_string);
-        let cwd = agent["result"]["cwd"].as_str().map(str::to_string);
-        let session = &agent["result"]["agent_session"];
+        let cwd = info["cwd"].as_str().map(str::to_string);
+        let session = &info["agent_session"];
         let recap = (|| {
             let kind = session["agent"].as_str().unwrap_or("");
             let path_kind = session["kind"].as_str().unwrap_or("");
@@ -1282,6 +1283,15 @@ fn top_message_id(text: &str) -> Option<String> {
 
 fn error_value(id: &str, code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({"id": id, "error": {"code": code, "message": message}})
+}
+
+/// The `AgentInfo` object of an `agent.get` reply.
+///
+/// Herdr answers `agent.get` with `{"result": {"type": "agent_info", "agent": {..}}}`
+/// (protocol 22 `success_response`). `agent_session`, `cwd` and `name` live on that
+/// inner object, not on `result`.
+fn agent_info(response: &serde_json::Value) -> &serde_json::Value {
+    &response["result"]["agent"]
 }
 
 fn status_in(value: &serde_json::Value) -> Option<String> {

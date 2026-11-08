@@ -222,26 +222,34 @@ async fn spawn_socket(path: std::path::PathBuf, session: String, seen: Arc<Mutex
                 seen.lock().unwrap().push(req.clone());
                 let id = req["id"].as_str().unwrap_or("");
                 let method = req["method"].as_str().unwrap_or("");
+                // Reply shapes follow herdr's protocol 22 `success_response` schema:
+                // agent methods wrap an `AgentInfo` object under `result.agent`.
                 let body = match method {
                     "agent.get" => json!({
                         "id": id,
                         "result": {
-                            "name": "pi",
-                            "agent": "omp",
-                            "agent_status": "blocked",
-                            "cwd": "/work/app",
-                            "pane_id": "w1:p1",
-                            "agent_session": {
-                                "source": "detected",
+                            "type": "agent_info",
+                            "agent": {
+                                "name": "pi",
                                 "agent": "omp",
-                                "kind": "path",
-                                "value": session,
+                                "agent_status": "blocked",
+                                "cwd": "/work/app",
+                                "pane_id": "w1:p1",
+                                "agent_session": {
+                                    "source": "herdr:omp",
+                                    "agent": "omp",
+                                    "kind": "path",
+                                    "value": session,
+                                }
                             }
                         }
                     }),
                     "agent.prompt" => json!({
                         "id": id,
-                        "result": {"type": "ok", "agent_status": "working"}
+                        "result": {
+                            "type": "agent_prompted",
+                            "agent": {"agent": "omp", "agent_status": "working", "pane_id": "w1:p1"}
+                        }
                     }),
                     "agent.send_keys" => json!({"id": id, "result": {"type": "ok"}}),
                     _ => json!({"id": id, "result": {"type": "ok", "echo_method": method}}),
